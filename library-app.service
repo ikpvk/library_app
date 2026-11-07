@@ -1,0 +1,15 @@
+[Unit]
+Description=Library web app (image-based books)
+After=network-online.target
+
+[Service]
+# %h is your home folder. Change these paths if the repo lives somewhere else.
+WorkingDirectory=%h/Downloads/work/library_app
+ExecStart=/usr/bin/python3 %h/Downloads/work/library_app/server.py
+# Environment=LIBRARY_ROOT=%h/Downloads/media/books
+# Environment=LIBRARY_PORT=8765
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
