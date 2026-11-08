@@ -13,6 +13,7 @@ import json
 import mimetypes
 import os
 import re
+import struct
 import threading
 import time
 from http import HTTPStatus
@@ -31,6 +32,8 @@ ROOT: Path = Path()
 _scan_cache = {"time": 0.0, "books": []}
 _scan_lock = threading.Lock()
 _progress_lock = threading.Lock()
+_size_cache: dict = {}
+SIZE_CACHE_MAX = 50_000
 
 
 def natural_key(name: str):
@@ -72,12 +75,16 @@ def has_images(path: Path) -> bool:
     return images >= 2 and images >= 0.8 * len(files)
 
 
+def chapter_dirs(book: Path):
+    """The book's chapter folders, in reading order. Every endpoint uses this list."""
+    return [d for d in visible_dirs(book) if has_images(Path(d.path))]
+
+
 def scan_library():
     books = []
 
     def walk(path: Path, depth: int):
-        subdirs = visible_dirs(path)
-        chapters = [d for d in subdirs if has_images(Path(d.path))]
+        chapters = chapter_dirs(path)
         if chapters:
             rel = path.relative_to(ROOT).as_posix()
             first_pages = images_in(Path(chapters[0].path))
@@ -90,7 +97,7 @@ def scan_library():
             })
             return
         if depth < MAX_DEPTH:
-            for d in subdirs:
+            for d in visible_dirs(path):
                 walk(Path(d.path), depth + 1)
 
     walk(ROOT, 0)
@@ -114,6 +121,116 @@ def safe_path(rel: str) -> Path | None:
     if p != ROOT and ROOT not in p.parents:
         return None
     return p
+
+
+def find_book(rel: str):
+    """Return (path, chapters) for a book inside the root, or None if there is no such book."""
+    book = safe_path(rel)
+    if not book or not book.is_dir():
+        return None
+    chapters = chapter_dirs(book)
+    if not chapters:
+        return None
+    return book, chapters
+
+
+def parse_index(value) -> int | None:
+    """A non-negative whole-number index, or None.
+
+    Takes a JSON integer or a string of digits. Fractions, infinities,
+    booleans and negative numbers are refused rather than rounded.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and re.fullmatch(r"[0-9]{1,9}", value):
+        return int(value)
+    return None
+
+
+def _exif_orientation(seg: bytes) -> int | None:
+    """The EXIF orientation tag from a JPEG APP1 segment, if there is one."""
+    if seg[:6] != b"Exif\0\0":
+        return None
+    t = seg[6:]
+    order = {b"II": "<", b"MM": ">"}.get(t[:2])
+    if not order:
+        return None
+    try:
+        ifd = struct.unpack(order + "I", t[4:8])[0]
+        count = struct.unpack(order + "H", t[ifd:ifd + 2])[0]
+        for i in range(count):
+            entry = t[ifd + 2 + 12 * i:ifd + 14 + 12 * i]
+            if struct.unpack(order + "H", entry[:2])[0] == 0x0112:
+                return struct.unpack(order + "H", entry[8:10])[0]
+    except struct.error:
+        pass
+    return None
+
+
+def _read_size(f) -> tuple[int, int] | None:
+    """Width and height from an image file's header, as the browser will show it."""
+    head = f.read(32)
+    if head[:8] == b"\x89PNG\r\n\x1a\n" and head[12:16] == b"IHDR":
+        return struct.unpack(">II", head[16:24])
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return struct.unpack("<HH", head[6:10])
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        kind = head[12:16]
+        if kind == b"VP8 ":
+            w, h = struct.unpack("<HH", head[26:30])
+            return w & 0x3FFF, h & 0x3FFF
+        if kind == b"VP8L" and head[20] == 0x2F:
+            bits = int.from_bytes(head[21:25], "little")
+            return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+        if kind == b"VP8X":
+            return int.from_bytes(head[24:27], "little") + 1, int.from_bytes(head[27:30], "little") + 1
+        return None
+    if head[:2] != b"\xff\xd8":
+        return None
+    # JPEG: walk the segments to the frame header, noting the EXIF orientation on the way.
+    f.seek(2)
+    orientation = None
+    for _ in range(1000):
+        b = f.read(1)
+        while b == b"\xff":
+            b = f.read(1)
+        if not b:
+            return None
+        marker = b[0]
+        if marker == 0x01 or 0xD0 <= marker <= 0xD9:
+            continue
+        length = struct.unpack(">H", f.read(2))[0]
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            h, w = struct.unpack(">xHH", f.read(5))
+            return (h, w) if orientation in (5, 6, 7, 8) else (w, h)
+        if marker == 0xDA:
+            return None
+        if marker == 0xE1 and orientation is None:
+            orientation = _exif_orientation(f.read(length - 2))
+        else:
+            f.seek(length - 2, 1)
+    return None
+
+
+def image_size(path: Path) -> list[int] | None:
+    """[width, height] of an image, or None when the header can't be read. Cached."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    if key not in _size_cache:
+        try:
+            with open(path, "rb") as f:
+                size = _read_size(f)
+        except (OSError, struct.error, ValueError, IndexError):
+            size = None
+        if len(_size_cache) >= SIZE_CACHE_MAX:
+            _size_cache.clear()
+        _size_cache[key] = list(size) if size and all(size) else None
+    return _size_cache[key]
 
 
 def load_progress():
@@ -158,14 +275,11 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json(books)
 
         if url.path == "/api/book":
-            book = safe_path(q.get("id", ""))
-            if not book or not book.is_dir():
+            found = find_book(q.get("id", ""))
+            if not found:
                 return self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
-            chapters = []
-            for d in visible_dirs(book):
-                pages = images_in(Path(d.path))
-                if pages:
-                    chapters.append({"name": d.name, "pages": len(pages)})
+            book, dirs = found
+            chapters = [{"name": d.name, "pages": len(images_in(Path(d.path)))} for d in dirs]
             return self.send_json({
                 "id": q["id"],
                 "title": book.name,
@@ -174,23 +288,22 @@ class Handler(SimpleHTTPRequestHandler):
             })
 
         if url.path == "/api/chapter":
-            book = safe_path(q.get("book", ""))
-            if not book or not book.is_dir():
+            found = find_book(q.get("book", ""))
+            idx = parse_index(q.get("ch", "0"))
+            if not found or idx is None or idx >= len(found[1]):
                 return self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
-            chapters = [d for d in visible_dirs(book) if has_images(Path(d.path))]
-            try:
-                idx = int(q.get("ch", "0"))
-                ch = chapters[idx]
-            except (ValueError, IndexError):
-                return self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            book, chapters = found
+            ch = chapters[idx]
             rel = f"{q['book']}/{ch.name}"
+            pages = images_in(Path(ch.path))
             return self.send_json({
                 "book": q["book"],
                 "title": book.name,
                 "index": idx,
                 "name": ch.name,
                 "total": len(chapters),
-                "pages": [f"{rel}/{p}" for p in images_in(Path(ch.path))],
+                "pages": [f"{rel}/{p}" for p in pages],
+                "sizes": [image_size(Path(ch.path) / p) for p in pages],
             })
 
         if url.path == "/img":
@@ -210,10 +323,15 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             length = min(int(self.headers.get("Content-Length", 0)), 10_000)
             data = json.loads(self.rfile.read(length))
-            book, chapter, page = str(data["book"]), int(data["chapter"]), int(data["page"])
+            book, chapter, page = str(data["book"]), parse_index(data["chapter"]), parse_index(data["page"])
         except (ValueError, KeyError, TypeError):
             return self.send_json({"error": "bad request"}, HTTPStatus.BAD_REQUEST)
-        if not safe_path(book):
+        if chapter is None or page is None:
+            return self.send_json({"error": "bad request"}, HTTPStatus.BAD_REQUEST)
+        found = find_book(book)
+        if not found or chapter >= len(found[1]):
+            return self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+        if page >= len(images_in(Path(found[1][chapter].path))):
             return self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
         save_progress(book, chapter, page)
         return self.send_json({"ok": True})

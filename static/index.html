@@ -63,6 +63,8 @@
   .pages { max-width: 900px; margin: 0 auto; }
   .pages img { display: block; width: 100%; height: auto; min-height: 40vh; background: var(--panel); }
   .pages img.loaded { min-height: 0; background: none; }
+  /* Pages with known dimensions reserve their exact height, so loading doesn't move the layout. */
+  .pages img.sized { min-height: 0; }
   .chapter-end { display: flex; justify-content: center; gap: 10px; padding: 30px 16px 90px; }
   .bar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 5; display: flex; align-items: center;
     gap: 8px; padding: 10px calc(16px + env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom))
@@ -99,6 +101,9 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, v); } catch {} },
 };
 let cleanup = () => {};
+// Each navigation gets a number. A view whose number is no longer current stops
+// at its next await, so a slow response can't overwrite a newer page.
+let navId = 0;
 
 async function api(path) {
   const r = await fetch(path);
@@ -118,9 +123,10 @@ function setHeader(title, backHref) {
 const chapterLabel = name => name.replace(/^\d+\s*-\s*/, "");
 
 /* ---------- Library ---------- */
-async function showLibrary() {
+async function showLibrary(isCurrent) {
   setHeader("Library");
   const books = await api("/api/books");
+  if (!isCurrent()) return;
   if (!books.length) { app.innerHTML = `<p class="empty">No books found.</p>`; return; }
   // Books with saved progress, most recently read first.
   const reading = books.filter(b => b.progress).sort((a, b) => b.progress.time - a.progress.time);
@@ -160,8 +166,9 @@ async function showLibrary() {
 }
 
 /* ---------- Book ---------- */
-async function showBook(id) {
+async function showBook(id, isCurrent) {
   const b = await api(`/api/book?id=${enc(id)}`);
+  if (!isCurrent()) return;
   setHeader(b.title, "#/");
   const p = b.progress;
   const first = b.chapters[0];
@@ -184,30 +191,43 @@ async function showBook(id) {
     </ul>`;
   // Cover: first page of the first chapter.
   api(`/api/chapter?book=${enc(id)}&ch=0`).then(c => {
-    if (c.pages[0]) document.getElementById("cover").src = img(c.pages[0]);
-  });
+    if (isCurrent() && c.pages[0]) document.getElementById("cover").src = img(c.pages[0]);
+  }).catch(() => {});
   app.querySelector(".current")?.scrollIntoView({ block: "center" });
 }
 
 /* ---------- Reader ---------- */
-async function showReader(id, chIdx, startPage) {
-  const c = await api(`/api/chapter?book=${enc(id)}&ch=${chIdx}`);
-  const book = await api(`/api/book?id=${enc(id)}`);
+async function showReader(id, chIdx, startPage, isCurrent) {
+  const [c, book] = await Promise.all([
+    api(`/api/chapter?book=${enc(id)}&ch=${chIdx}`),
+    api(`/api/book?id=${enc(id)}`),
+  ]);
+  if (!isCurrent()) return;
   setHeader(`${c.title} · ${chapterLabel(c.name)}`, `#/book/${enc(id)}`);
   document.body.classList.add("reading");
 
-  let page = Math.min(startPage || 0, c.pages.length - 1);
+  let page = Math.max(0, Math.min(startPage || 0, c.pages.length - 1));
   const hasPrev = chIdx > 0, hasNext = chIdx < c.total - 1;
   const goChapter = i => location.hash = `#/read/${enc(id)}/${i}`;
 
-  let saveTimer;
-  const save = () => {
+  // Saves are debounced; flush() sends a pending save right away. keepalive lets
+  // the request finish even when the page is closing.
+  let saveTimer, pending = false;
+  const flush = () => {
     clearTimeout(saveTimer);
-    saveTimer = setTimeout(() => fetch("/api/progress", {
-      method: "POST", headers: { "Content-Type": "application/json" },
+    if (!pending) return;
+    pending = false;
+    fetch("/api/progress", {
+      method: "POST", headers: { "Content-Type": "application/json" }, keepalive: true,
       body: JSON.stringify({ book: id, chapter: chIdx, page }),
-    }), 600);
+    }).catch(() => {});
   };
+  const save = () => {
+    pending = true;
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(flush, 600);
+  };
+  const onHide = () => { if (document.visibilityState === "hidden") flush(); };
 
   const options = book.chapters.map((ch, i) =>
     `<option value="${i}" ${i === chIdx ? "selected" : ""}>${esc(chapterLabel(ch.name))}</option>`).join("");
@@ -224,8 +244,12 @@ async function showReader(id, chIdx, startPage) {
   const pos = bar.querySelector("#pos");
   const showPos = () => pos.textContent = `${page + 1} / ${c.pages.length}`;
 
+  const sizeAttrs = i => {
+    const s = c.sizes?.[i];
+    return s ? `width="${+s[0]}" height="${+s[1]}" class="sized"` : "";
+  };
   app.innerHTML = `<div class="pages">${c.pages.map((p, i) =>
-    `<img data-i="${i}" ${i < 3 ? `src="${img(p)}"` : `data-src="${img(p)}"`} alt="Page ${i + 1}">`).join("")}</div>
+    `<img data-i="${i}" ${sizeAttrs(i)} ${i < 3 ? `src="${img(p)}"` : `data-src="${img(p)}"`} alt="Page ${i + 1}">`).join("")}</div>
     <div class="chapter-end">
       ${hasNext ? `<button class="primary" id="endNext">Next chapter ›</button>`
                 : `<button id="endBack">Finished · back to book</button>`}</div>`;
@@ -243,12 +267,8 @@ async function showReader(id, chIdx, startPage) {
   const tracker = new IntersectionObserver(es => es.forEach(e => {
     if (e.isIntersecting) { page = +e.target.dataset.i; showPos(); save(); }
   }), { rootMargin: "-40% 0px -59% 0px" });
-  imgs.forEach(el => { loader.observe(el); tracker.observe(el); });
+  imgs.forEach(el => loader.observe(el));
   showPos();
-  if (page > 0) {
-    imgs.slice(0, page + 1).forEach(load);
-    requestAnimationFrame(() => imgs[page].scrollIntoView());
-  } else window.scrollTo(0, 0);
 
   // Hide the header and bar while scrolling down; show them when scrolling up.
   let lastY = scrollY;
@@ -257,24 +277,49 @@ async function showReader(id, chIdx, startPage) {
     lastY = scrollY;
   };
   window.addEventListener("scroll", onScroll, { passive: true });
+  window.addEventListener("pagehide", flush);
+  document.addEventListener("visibilitychange", onHide);
 
   cleanup = () => {
-    loader.disconnect(); tracker.disconnect(); clearTimeout(saveTimer);
+    flush();
+    loader.disconnect(); tracker.disconnect();
     window.removeEventListener("scroll", onScroll);
+    window.removeEventListener("pagehide", flush);
+    document.removeEventListener("visibilitychange", onHide);
     bar.remove();
     document.body.classList.remove("reading", "hide-ui");
   };
+
+  if (page > 0) {
+    // Pages with known sizes already hold their final height. Any page above the
+    // saved one without a size would change height when it loads, so wait for
+    // those before scrolling. Tracking starts only after that, so a displaced
+    // position is never saved.
+    const unsized = imgs.slice(0, page).filter(el => !el.classList.contains("sized"));
+    unsized.forEach(load);
+    const settled = el => el.complete ? Promise.resolve() : new Promise(r => {
+      el.addEventListener("load", r, { once: true });
+      el.addEventListener("error", r, { once: true });
+    });
+    await Promise.all(unsized.map(settled));
+    if (!isCurrent()) return;
+    imgs[page].scrollIntoView();
+  } else window.scrollTo(0, 0);
+  imgs.forEach(el => tracker.observe(el));
 }
 
 /* ---------- Router ---------- */
 async function route() {
   cleanup(); cleanup = () => {};
+  const nav = ++navId;
+  const isCurrent = () => nav === navId;
   const parts = location.hash.replace(/^#\/?/, "").split("/").map(decodeURIComponent);
   try {
-    if (parts[0] === "book" && parts[1]) await showBook(parts[1]);
-    else if (parts[0] === "read" && parts[1]) await showReader(parts[1], +parts[2] || 0, +parts[3] || 0);
-    else await showLibrary();
+    if (parts[0] === "book" && parts[1]) await showBook(parts[1], isCurrent);
+    else if (parts[0] === "read" && parts[1]) await showReader(parts[1], +parts[2] || 0, +parts[3] || 0, isCurrent);
+    else await showLibrary(isCurrent);
   } catch (e) {
+    if (!isCurrent()) return;
     app.innerHTML = `<p class="empty">Couldn't load this page (${esc(e.message)}). <a href="#/">Back to library</a></p>`;
   }
 }

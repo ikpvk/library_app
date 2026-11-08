@@ -97,7 +97,9 @@ Changes to `static/index.html` don't need a restart. Just reload the page.
 
 ## Reading progress
 
-Progress is stored in `progress.json` next to `server.py`, with one entry per book: the chapter and page you were last on, and when. The page is saved when it reaches the middle of the screen. The file isn't tracked by git.
+Progress is stored in `progress.json` next to `server.py`, with one entry per book: the chapter and page you were last on, and when. The page is saved shortly after it reaches the middle of the screen, and straight away when you leave the reader, close the tab or switch away from it. The file isn't tracked by git.
+
+When you continue a book, the reader opens on your saved page and stays there while the pages above it load.
 
 - There's one saved place per book, shared by every device and everyone who uses the server.
 - It's tied to the book's folder path. Renaming or moving a book folder loses its progress.
@@ -116,6 +118,7 @@ Progress is stored in `progress.json` next to `server.py`, with one entry per bo
 | `library-app.service` | systemd user service for autostart |
 | `progress.json` | Saved reading progress, created on first use. Not in git |
 | `LICENSE` | MIT license |
+| `AGENTS.md` | Guidelines for contributors and coding agents: commands, conventions, rules to keep, and how to test |
 
 ### API
 
@@ -123,11 +126,20 @@ Progress is stored in `progress.json` next to `server.py`, with one entry per bo
 |---|---|
 | `GET /api/books` | Every book with its cover, chapter count and saved progress |
 | `GET /api/book?id=<book>` | One book's chapters and page counts |
-| `GET /api/chapter?book=<book>&ch=<index>` | The page image paths for one chapter |
+| `GET /api/chapter?book=<book>&ch=<index>` | The page image paths for one chapter, and each page's `[width, height]` in `sizes` (`null` when unknown) |
 | `GET /img?p=<path>` | One image, cached by the browser for a week |
 | `POST /api/progress` | Saves `{"book", "chapter", "page"}`. Chapter and page count from 0 |
 
 `<book>` is the book folder's path relative to the library folder.
+
+Chapter and page indices must be whole numbers, 0 or more. A malformed progress request returns 400. An unknown book, a chapter or page that doesn't exist, or a malformed `ch` value returns 404.
+
+## Open issues
+
+- [ ] **Retry failed progress saves.** The reader clears its pending save before the request succeeds and silently ignores HTTP and network errors. Keep failed updates pending and retry them when connectivity returns.
+- [ ] **Preserve progress save order.** Multiple saves can be in flight, allowing an older, delayed request to overwrite a newer reading position. Serialize saves or add ordering information that the server validates.
+- [ ] **Exclude hidden image files from page lists.** Chapter detection ignores hidden files, but page discovery includes files such as macOS `._001.png` metadata. Apply consistent filtering to prevent broken pages and incorrect page counts.
+- [ ] **Enforce library containment during discovery.** Scanning follows directory symlinks outside the library root, exposing external filenames and image dimensions through chapter metadata. Image downloads remain blocked, leaving broken chapters. Check resolved paths during discovery and dimension reads.
 
 ## License
 
